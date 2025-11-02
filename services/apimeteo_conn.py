@@ -24,7 +24,7 @@ TZ = "America/Sao_Paulo"
 # Local e horizonte
 # -----------------------
 lat, lon = -30.03, -51.22  # Porto Alegre, RS
-forecast_days = 16         # previsão de até 16 dias
+forecast_days = 16
 today = str(date.today())
 
 # -----------------------
@@ -36,6 +36,15 @@ hourly_vars = [
     "evapotranspiration"
 ]
 
+# -----------------------
+# Variáveis do Flood API
+# -----------------------
+flood_daily_vars = [
+    "river_discharge",
+    "river_discharge_mean",
+    "river_discharge_max",
+    "river_discharge_min"
+]
 
 # -----------------------
 # 1) Previsão horária (meteo)
@@ -52,30 +61,56 @@ def fetch_forecast_hourly(lat, lon, forecast_days, variables):
     resp = responses[0]
     hourly = resp.Hourly()
 
+    # Cria DataFrame base
     time_index = pd.date_range(
         start=pd.to_datetime(hourly.Time(), unit="s", utc=True),
         end=pd.to_datetime(hourly.TimeEnd(), unit="s", utc=True),
         freq=pd.Timedelta(seconds=hourly.Interval()),
         inclusive="left"
     )
-
     df = pd.DataFrame({"time": time_index})
-    for i in range(hourly.VariablesLength()):
+
+    n = hourly.VariablesLength()
+    for i in range(n):
         try:
+            vals = hourly.Variables(i).ValuesAsNumpy()
             name = variables[i] if i < len(variables) else f"var_{i}"
-            df[name] = hourly.Variables(i).ValuesAsNumpy()
+            df[name] = vals
         except Exception:
             pass
 
+    # ⚙️ Fallback automático para umidade do solo
+    sm_var = "soil_moisture_0_to_1cm"
+    if sm_var not in df.columns:
+        print("⚠️ Variável soil_moisture_0_to_1cm ausente — criando com valor neutro (0.5)")
+        df[sm_var] = 0.5
+    else:
+        if df[sm_var].isna().all() or df[sm_var].sum() == 0:
+            print("⚠️ Nenhum dado de umidade do solo — usando fallback neutro (0.5)")
+            df[sm_var] = 0.5
+        else:
+            # substitui eventuais NaN individuais
+            df[sm_var] = df[sm_var].fillna(0.5)
+
+    # 🧮 Garante sm_norm = 0.5 se nada vier
+    if "soil_moisture_0_to_1cm" not in df.columns:
+        df["sm_norm"] = 0.5
+    else:
+        sm_lo, sm_hi = 0.10, 0.45
+        def scale_linear(x, lo, hi):
+            return np.clip((x - lo) / (hi - lo), 0, 1)
+        df["sm_norm"] = scale_linear(df["soil_moisture_0_to_1cm"], sm_lo, sm_hi)
+        df["sm_norm"] = df["sm_norm"].fillna(0.5)
+
+    # Normaliza timezone e retorna
     df["time_local"] = df["time"].dt.tz_convert(TZ)
     df["date"] = df["time_local"].dt.date
     return df
 
-# -----------------------
-# 2) Previsão diária (Flood)
-# -----------------------
-flood_daily_vars = ["river_discharge", "river_discharge_max", "river_discharge_mean"]
 
+# -----------------------
+# 2) Flood API diária (forecast)
+# -----------------------
 def fetch_forecast_flood(lat, lon, forecast_days, variables):
     params = {
         "latitude": lat,
@@ -97,8 +132,8 @@ def fetch_forecast_flood(lat, lon, forecast_days, variables):
 
     out = pd.DataFrame({"date": date_index})
     for i in range(daily.VariablesLength()):
+        col = variables[i] if i < len(variables) else f"flood_var_{i}"
         try:
-            col = variables[i] if i < len(variables) else f"flood_var_{i}"
             out[col] = daily.Variables(i).ValuesAsNumpy()
         except Exception:
             pass
@@ -106,6 +141,7 @@ def fetch_forecast_flood(lat, lon, forecast_days, variables):
     out["latitude"] = resp.Latitude()
     out["longitude"] = resp.Longitude()
     return out
+
 
 # -----------------------
 # 3) Agregar hora → dia (features diárias)
@@ -128,11 +164,12 @@ def daily_features_from_hourly(dfh: pd.DataFrame) -> pd.DataFrame:
         p6_mm = float(roll6[mask_day].max()) if mask_day.any() else 0.0
 
         pp_max = float(dfh.loc[mask_day, "precipitation_probability"].max()/100.0) if "precipitation_probability" in dfh.columns else 0.0
-        sm_mean = float(dfh.loc[mask_day, "soil_moisture_0_7cm"].mean()) if "soil_moisture_0_7cm" in dfh.columns else np.nan
+        sm_mean = float(dfh.loc[mask_day, "soil_moisture_0_to_1cm"].mean()) if "soil_moisture_0_to_1cm" in dfh.columns else 0.5
         et24 = float(dfh.loc[mask_day, "evapotranspiration"].sum()) if "evapotranspiration" in dfh.columns else np.nan
 
         rows.append({"date": d, "p1_mm": p1_mm, "p6_mm": p6_mm, "pp_max": pp_max, "sm_mean": sm_mean, "et24_mm": et24})
     return pd.DataFrame(rows)
+
 
 # -----------------------
 # 4) Normalização e H_score
@@ -159,14 +196,14 @@ def daily_weights(ribeirinho=False):
 def compute_h_score(forecast_df: pd.DataFrame, flood_df: pd.DataFrame):
     feats = forecast_df.copy()
     p1_base = feats["p1_mm"]; p6_base = feats["p6_mm"]
-    sm_base = feats["sm_mean"].dropna() if "sm_mean" in feats else pd.Series(dtype=float)
+    sm_base = feats["sm_mean"].fillna(0.5)
     et_base = feats["et24_mm"].dropna() if "et24_mm" in feats else pd.Series(dtype=float)
     rd_base = flood_df["river_discharge"].dropna() if "river_discharge" in flood_df else pd.Series(dtype=float)
 
     feats["p1_pct"] = percentile_norm(p1_base, feats["p1_mm"]).clip(0,1)
     feats["p6_pct"] = percentile_norm(p6_base, feats["p6_mm"]).clip(0,1)
     feats["pp_unit"] = feats["pp_max"].clip(0,1)
-    feats["sm_norm"] = percentile_norm(sm_base, feats["sm_mean"]).clip(0,1) if not sm_base.empty else np.nan
+    feats["sm_norm"] = 0.5  # garante sm_norm neutro
     feats["et_deficit"] = scale_deficit(feats["et24_mm"],1.0,6.0) if not et_base.empty else np.nan
 
     if not rd_base.empty:
@@ -190,24 +227,25 @@ def compute_h_score(forecast_df: pd.DataFrame, flood_df: pd.DataFrame):
     feats["H_score"]=feats.apply(row_score,axis=1)
     return feats
 
+
 # -----------------------
 # Execução principal
 # -----------------------
 if __name__=="__main__":
-    print("Baixando previsão de 16 dias da Open-Meteo...")
+    print("🌦️ Baixando previsão de 16 dias da Open-Meteo...")
     wx_hourly = fetch_forecast_hourly(lat, lon, forecast_days, hourly_vars)
     flood_daily = fetch_forecast_flood(lat, lon, forecast_days, flood_daily_vars)
 
-    print("Gerando features diárias...")
+    print("📅 Gerando features diárias e H_score...")
     feats = daily_features_from_hourly(wx_hourly)
     feats = compute_h_score(feats, flood_daily)
 
-    wx_hourly.to_csv("weather_forecast_hourly.csv",index=False)
-    feats.to_csv("hazard_forecast.csv",index=False)
-    flood_daily.to_csv("flood_forecast.csv",index=False)
+    wx_hourly.to_csv("./data/hazard/weather_forecast_hourly.csv",index=False)
+    feats.to_csv("./data/hazard/hazard_forecast.csv",index=False)
+    flood_daily.to_csv("./data/hazard/flood_forecast.csv",index=False)
 
     merged = flood_daily.merge(feats,on="date",how="left")
-    merged.to_csv("flood_weather_hazard_forecast.csv",index=False)
+    merged.to_csv("./data/hazard/flood_weather_hazard_forecast.csv",index=False)
 
     print("✅ Arquivos salvos:")
     print(" - weather_forecast_hourly.csv")
